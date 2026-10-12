@@ -1,0 +1,139 @@
+# ===================== Python通用 =====================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# 虚拟环境
+venv/
+env/
+ENV/
+.venv/
+.env/
+virtualenv/
+conda_env/
+
+# ===================== ML 机器学习专用 =====================
+# 模型权重、checkpoint
+*.pth
+*.pt
+*.ckpt
+*.bin
+*.safetensors
+*.h5
+*.hdf5
+*.onnx
+*.pb
+*.tflite
+checkpoints/
+weights/
+models/
+saved_models/
+
+# 数据集 & 大文件
+data/
+dataset/
+datasets/
+decision_matrix/
+features/
+pictures/
+raw_data/
+processed_data/
+text_creator/
+text_creator_v2/
+*.npy
+*.npz
+*.parquet
+*.csv
+*.jsonl
+*.zip
+*.tar
+*.gz
+*.7z
+
+
+# 训练日志、输出结果
+runs/          # tensorboard
+logs/
+log/
+output/
+outputs/
+results/
+experiments/
+wandb/         # wandb日志
+mlruns/        # mlflow
+*.log
+
+# Jupyter notebook
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/*
+*.ipynb
+!*.ipynb       # 保留notebook文件，只忽略缓存
+
+# ===================== IDE & 编辑器 =====================
+# PyCharm
+.idea/
+*.iml
+*.iws
+*.out
+*.xml
+
+# VSCode
+.vscode/
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
+# VSCode 用户本地缓存
+.vscode/.cache
+
+# vscode jupyter
+*.ipynb.metadata
+
+# 其他编辑器
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ===================== 其他 =====================
+# 环境变量
+.env
+.env.local
+.env.*
+
+# 临时文件
+tmp/
+temp/
+cache/
+.cache/
+
+# 报告图片
+*.png
+*.jpg
+*.jpeg
+*.gif
+!assets/*.png
+!assets/*.jpg
+
+# 论文
+论文/
