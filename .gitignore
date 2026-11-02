@@ -67,6 +67,8 @@ text_creator_v2/
 *.tar
 *.gz
 *.7z
+*.mat
+*.ffe
 
 
 # 训练日志、输出结果

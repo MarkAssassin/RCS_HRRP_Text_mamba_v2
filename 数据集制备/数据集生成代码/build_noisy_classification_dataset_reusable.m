@@ -1,0 +1,706 @@
+function result = build_noisy_classification_dataset_reusable(userConfig)
+%% 将四类干净RCS/HRRP划分为训练集和测试集，并逐样本添加AWGN
+% 直接运行：
+%   build_noisy_classification_dataset_reusable
+%
+% 外部覆盖示例：
+%   userConfig.snrDbList = -10:5:20;
+%   userConfig.buildHrrp = false;
+%   result = build_noisy_classification_dataset_reusable(userConfig);
+
+%% ======================== 集中配置区 ========================
+projectRoot = fileparts(fileparts(mfilename('fullpath')));
+
+% 数据类型开关。
+cfg.buildRcs  = true;
+cfg.buildHrrp = true;
+
+% 输入频段、目录及变量名。
+cfg.band = 'S';
+cfg.inputDir = fullfile(projectRoot, '生成数据');
+cfg.rcsInputNameFormat  = 'rcs_%s.mat';
+cfg.rcsInputVariable    = 'rcs_zhaidai_cell';
+cfg.hrrpInputNameFormat = 'hrrp_%s.mat';
+cfg.hrrpInputVariable   = 'hrrp_kuandai_cell';
+
+% 目标与类别标签。默认目标1~4对应标签0~3。
+cfg.targetIndices = 1:4;
+cfg.classLabels   = 0:3;
+
+% 每类数据按照原始顺序划分。
+% 角度数据排序必须是：初始俯仰角最外层、进动频率中间、进动角最内层。
+cfg.trainCasesPerTarget = 10 * 11 * 11;  % 1210
+cfg.testCasesPerTarget  = 3 * 11 * 11;   % 363
+
+% 噪声配置。可以一次生成一个或多个SNR的数据集。
+cfg.snrDbList = 5:5:20;              % 例如 -10:5:20
+cfg.noiseRealizations = 1;      % 多次噪声实现可用于计算均值和标准差
+cfg.trainNoiseSeedBase = 1001;
+cfg.testNoiseSeedBase  = 2001;
+% true：同一噪声实现下，各SNR复用相同随机噪声形状，仅改变强度。
+cfg.reuseNoiseAcrossSnr = true;
+
+% HRRP的SNR参考功率定义：
+% 'whole_sample'   按整幅HRRP均方功率（原有方式，向后兼容）；
+% 'peak'           先FFT恢复频域回波，再按频域最大瞬时功率加噪；
+% 'energy_fraction'按累计指定能量占比的主距离单元平均功率。
+cfg.hrrpNoise.mode = 'whole_sample';
+cfg.hrrpNoise.energyFraction = 0.90;
+% 当前生成的HRRP在IFFT后沿距离维执行过fftshift。
+cfg.hrrpNoise.inputIsFftShifted = true;
+
+% 可选的测试集实际SNR核验。
+cfg.noiseTest.enabled = false;
+cfg.noiseTest.mode = 'random';       % 'random' 随机抽样；'all' 遍历全部
+cfg.noiseTest.randomSampleCount = 10;
+cfg.noiseTest.randomSeedBase = 3001;
+cfg.noiseTest.printEachSample = true;
+% [] 表示不告警；例如设为1表示平均绝对误差超过1 dB时告警。
+cfg.noiseTest.warnMeanAbsoluteErrorDb = [];
+
+% 输出配置。
+cfg.saveResult     = true;
+cfg.outputDir      = fullfile(projectRoot, '识别数据集','data');
+cfg.matFileVersion = '-v7';
+cfg.saveCleanSplit = false;
+cfg.showProgress   = true;
+
+%% ======================== 合并并检查配置 ========================
+if nargin < 1 || isempty(userConfig)
+    userConfig = struct();
+end
+assert(isstruct(userConfig), 'userConfig必须是结构体。');
+cfg = mergeStructRecursive(cfg, userConfig);
+
+cfg.band = upper(strtrim(char(cfg.band)));
+cfg.hrrpNoise.mode = normalizeHrrpNoiseMode(cfg.hrrpNoise.mode);
+validateConfiguration(cfg);
+assert(exist('awgn', 'file') ~= 0, ...
+    '未找到awgn函数，请确认已安装Communications Toolbox。');
+
+if cfg.saveResult && ~isfolder(cfg.outputDir)
+    mkdir(cfg.outputDir);
+end
+
+result = struct();
+result.rcsFiles = {};
+result.hrrpFiles = {};
+result.cleanFiles = {};
+result.rcsNoiseReports = {};
+result.hrrpNoiseReports = {};
+
+%% ======================== 构建干净RCS划分 ========================
+if cfg.buildRcs
+    rcsInputFile = fullfile(cfg.inputDir, sprintf( ...
+        cfg.rcsInputNameFormat, cfg.band));
+    rcsCell = loadRequiredCell(rcsInputFile, cfg.rcsInputVariable);
+    [rcsTrainClean, rcsTrainLabels, ...
+     rcsTestClean, rcsTestLabels] = splitRcsByTarget(rcsCell, cfg);
+
+    if cfg.saveCleanSplit
+        cleanFile = fullfile(cfg.outputDir, sprintf( ...
+            'RCS_clean_%s.mat', cfg.band));
+        saveDataset(cleanFile, rcsTrainClean, rcsTrainLabels, ...
+            rcsTestClean, rcsTestLabels, [], struct(), ...
+            cfg, cfg.matFileVersion);
+        result.cleanFiles{end + 1} = cleanFile;
+    end
+end
+
+%% ======================== 构建干净HRRP划分 ========================
+if cfg.buildHrrp
+    hrrpInputFile = fullfile(cfg.inputDir, sprintf( ...
+        cfg.hrrpInputNameFormat, cfg.band));
+    hrrpCell = loadRequiredCell(hrrpInputFile, cfg.hrrpInputVariable);
+    [hrrpTrainClean, hrrpTrainLabels, ...
+     hrrpTestClean, hrrpTestLabels] = splitHrrpByTarget(hrrpCell, cfg);
+
+    if cfg.saveCleanSplit
+        cleanFile = fullfile(cfg.outputDir, sprintf( ...
+            'HRRP_clean_%s.mat', cfg.band));
+        saveDataset(cleanFile, hrrpTrainClean, hrrpTrainLabels, ...
+            hrrpTestClean, hrrpTestLabels, [], struct(), ...
+            cfg, cfg.matFileVersion);
+        result.cleanFiles{end + 1} = cleanFile;
+    end
+end
+
+%% ======================== 逐SNR、逐噪声实现生成数据 ========================
+for realizationIndex = 1:cfg.noiseRealizations
+    for snrIndex = 1:numel(cfg.snrDbList)
+        snrDb = cfg.snrDbList(snrIndex);
+
+        if cfg.reuseNoiseAcrossSnr
+            trainSeed = cfg.trainNoiseSeedBase + realizationIndex - 1;
+            testSeed  = cfg.testNoiseSeedBase  + realizationIndex - 1;
+        else
+            seedOffset = (realizationIndex - 1) * numel(cfg.snrDbList) ...
+                + snrIndex - 1;
+            trainSeed = cfg.trainNoiseSeedBase + seedOffset;
+            testSeed  = cfg.testNoiseSeedBase  + seedOffset;
+        end
+
+        realizationTag = formatRealizationTag( ...
+            realizationIndex, cfg.noiseRealizations);
+        snrTag = formatSnrTag(snrDb);
+
+        if cfg.buildRcs
+            % 随机种子只在整批开始前设置一次；循环内每个样本噪声均不同。
+            rcsTrainNoisy = addAwgnToRcsSamples( ...
+                rcsTrainClean, snrDb, trainSeed);
+            rcsTestNoisy = addAwgnToRcsSamples( ...
+                rcsTestClean, snrDb, testSeed);
+
+            rcsNoiseReport = struct();
+            if cfg.noiseTest.enabled
+                rcsNoiseReport = evaluateTestNoise( ...
+                    rcsTestClean, rcsTestNoisy, rcsTestLabels, ...
+                    1, snrDb, 'RCS', cfg.noiseTest, realizationIndex);
+                result.rcsNoiseReports{end + 1} = rcsNoiseReport;
+            end
+
+            if cfg.saveResult
+                outputFile = fullfile(cfg.outputDir, sprintf( ...
+                    'RCS_data_%s_%s%s.mat', ...
+                    cfg.band, snrTag, realizationTag));
+                saveDataset(outputFile, ...
+                    rcsTrainNoisy, rcsTrainLabels, ...
+                    rcsTestNoisy, rcsTestLabels, snrDb, ...
+                    rcsNoiseReport, cfg, ...
+                    cfg.matFileVersion);
+                result.rcsFiles{end + 1} = outputFile;
+            end
+
+            showProgress(cfg, 'RCS', snrDb, realizationIndex, ...
+                cfg.noiseRealizations, size(rcsTrainNoisy), ...
+                size(rcsTestNoisy));
+        end
+
+        if cfg.buildHrrp
+            % 每个第三维切片是一幅HRRP样本；展平后单独调用awgn。
+            hrrpTrainNoisy = addAwgnToHrrpSamples( ...
+                hrrpTrainClean, snrDb, trainSeed, cfg.hrrpNoise);
+            hrrpTestNoisy = addAwgnToHrrpSamples( ...
+                hrrpTestClean, snrDb, testSeed, cfg.hrrpNoise);
+
+            hrrpNoiseReport = struct();
+            if cfg.noiseTest.enabled
+                hrrpNoiseReport = evaluateTestNoise( ...
+                    hrrpTestClean, hrrpTestNoisy, hrrpTestLabels, ...
+                    3, snrDb, 'HRRP', cfg.noiseTest, realizationIndex, ...
+                    cfg.hrrpNoise);
+                result.hrrpNoiseReports{end + 1} = hrrpNoiseReport;
+            end
+
+            if cfg.saveResult
+                outputFile = fullfile(cfg.outputDir, sprintf( ...
+                    'HRRP_data_%s_%s%s.mat', ...
+                    cfg.band, snrTag, realizationTag));
+                saveDataset(outputFile, ...
+                    hrrpTrainNoisy, hrrpTrainLabels, ...
+                    hrrpTestNoisy, hrrpTestLabels, snrDb, ...
+                    hrrpNoiseReport, cfg, ...
+                    cfg.matFileVersion);
+                result.hrrpFiles{end + 1} = outputFile;
+            end
+
+            showProgress(cfg, 'HRRP', snrDb, realizationIndex, ...
+                cfg.noiseRealizations, size(hrrpTrainNoisy), ...
+                size(hrrpTestNoisy));
+        end
+    end
+end
+
+result.cfg = cfg;
+fprintf('带噪分类数据集生成完成。\n');
+end
+
+%% ======================== 本地函数 ========================
+function validateConfiguration(cfg)
+    assert(numel(cfg.band) == 1, 'band必须是单个频段字符，例如''C''。');
+    assert(cfg.buildRcs || cfg.buildHrrp, ...
+        'buildRcs和buildHrrp不能同时为false。');
+    validateattributes(cfg.targetIndices, {'numeric'}, ...
+        {'vector', 'integer', 'positive', 'nonempty'});
+    validateattributes(cfg.classLabels, {'numeric'}, ...
+        {'vector', 'integer', 'nonnegative', 'nonempty'});
+    assert(numel(cfg.targetIndices) == numel(cfg.classLabels), ...
+        'targetIndices和classLabels的数量必须一致。');
+    assert(numel(unique(cfg.targetIndices)) == numel(cfg.targetIndices), ...
+        'targetIndices不能重复。');
+    assert(numel(unique(cfg.classLabels)) == numel(cfg.classLabels), ...
+        'classLabels不能重复。');
+    validateattributes(cfg.trainCasesPerTarget, {'numeric'}, ...
+        {'scalar', 'integer', 'positive'});
+    validateattributes(cfg.testCasesPerTarget, {'numeric'}, ...
+        {'scalar', 'integer', 'positive'});
+    validateattributes(cfg.snrDbList, {'numeric'}, ...
+        {'vector', 'real', 'finite', 'nonempty'});
+    validateattributes(cfg.noiseRealizations, {'numeric'}, ...
+        {'scalar', 'integer', 'positive'});
+    validateattributes(cfg.trainNoiseSeedBase, {'numeric'}, ...
+        {'scalar', 'integer', 'nonnegative'});
+    validateattributes(cfg.testNoiseSeedBase, {'numeric'}, ...
+        {'scalar', 'integer', 'nonnegative'});
+    assert(cfg.trainNoiseSeedBase ~= cfg.testNoiseSeedBase, ...
+        '训练集和测试集必须使用不同的随机种子。');
+    assert(isstruct(cfg.hrrpNoise), 'hrrpNoise必须是结构体。');
+    assert(any(strcmp(cfg.hrrpNoise.mode, ...
+        {'whole_sample', 'peak', 'energy_fraction'})), ...
+        ['hrrpNoise.mode只能是''whole_sample''、''peak''或' ...
+         '''energy_fraction''。']);
+    validateattributes(cfg.hrrpNoise.energyFraction, {'numeric'}, ...
+        {'scalar', 'real', 'finite', '>', 0, '<=', 1});
+    validateattributes(cfg.hrrpNoise.inputIsFftShifted, ...
+        {'logical', 'numeric'}, {'scalar'});
+    assert(isstruct(cfg.noiseTest), 'noiseTest必须是结构体。');
+    assert(any(strcmpi(cfg.noiseTest.mode, {'random', 'all'})), ...
+        'noiseTest.mode只能是''random''或''all''。');
+    validateattributes(cfg.noiseTest.randomSampleCount, {'numeric'}, ...
+        {'scalar', 'integer', 'positive'});
+    validateattributes(cfg.noiseTest.randomSeedBase, {'numeric'}, ...
+        {'scalar', 'integer', 'nonnegative'});
+    if ~isempty(cfg.noiseTest.warnMeanAbsoluteErrorDb)
+        validateattributes(cfg.noiseTest.warnMeanAbsoluteErrorDb, ...
+            {'numeric'}, {'scalar', 'real', 'finite', 'nonnegative'});
+    end
+    assert(any(strcmp(cfg.matFileVersion, {'-v7', '-v7.3'})), ...
+        'matFileVersion只能是''-v7''或''-v7.3''。');
+end
+
+function dataCell = loadRequiredCell(fileName, variableName)
+    assert(isfile(fileName), '输入文件不存在：%s', fileName);
+    fileInfo = whos('-file', fileName);
+    availableNames = {fileInfo.name};
+    assert(ismember(variableName, availableNames), ...
+        '文件%s中没有变量%s；现有变量：%s', ...
+        fileName, variableName, strjoin(availableNames, ', '));
+    loaded = load(fileName, variableName);
+    dataCell = loaded.(variableName);
+    assert(iscell(dataCell), '变量%s必须是Cell数组。', variableName);
+end
+
+function [trainData, trainLabels, testData, testLabels] = ...
+        splitRcsByTarget(dataCell, cfg)
+    validateTargetCells(dataCell, cfg);
+    firstTarget = dataCell{cfg.targetIndices(1)};
+    assert(ismatrix(firstTarget), 'RCS目标数据必须是二维矩阵。');
+    timeCount = size(firstTarget, 2);
+    classCount = numel(cfg.targetIndices);
+    totalTrain = cfg.trainCasesPerTarget * classCount;
+    totalTest  = cfg.testCasesPerTarget  * classCount;
+
+    trainData = zeros(totalTrain, timeCount, 'like', firstTarget);
+    testData  = zeros(totalTest,  timeCount, 'like', firstTarget);
+    trainLabels = zeros(1, totalTrain);
+    testLabels  = zeros(1, totalTest);
+
+    for classPosition = 1:classCount
+        targetIndex = cfg.targetIndices(classPosition);
+        targetData = dataCell{targetIndex};
+        assert(ismatrix(targetData) && size(targetData, 2) == timeCount, ...
+            '目标%d的RCS尺寸与其他目标不一致。', targetIndex);
+        requiredCases = cfg.trainCasesPerTarget + cfg.testCasesPerTarget;
+        assert(size(targetData, 1) >= requiredCases, ...
+            '目标%d只有%d个RCS样本，训练和测试共需要%d个。', ...
+            targetIndex, size(targetData, 1), requiredCases);
+
+        trainRows = (classPosition - 1) * cfg.trainCasesPerTarget ...
+            + (1:cfg.trainCasesPerTarget);
+        testRows = (classPosition - 1) * cfg.testCasesPerTarget ...
+            + (1:cfg.testCasesPerTarget);
+        sourceTrain = 1:cfg.trainCasesPerTarget;
+        sourceTest = cfg.trainCasesPerTarget + ...
+            (1:cfg.testCasesPerTarget);
+
+        trainData(trainRows, :) = targetData(sourceTrain, :);
+        testData(testRows, :) = targetData(sourceTest, :);
+        trainLabels(trainRows) = cfg.classLabels(classPosition);
+        testLabels(testRows) = cfg.classLabels(classPosition);
+    end
+end
+
+function [trainData, trainLabels, testData, testLabels] = ...
+        splitHrrpByTarget(dataCell, cfg)
+    validateTargetCells(dataCell, cfg);
+    firstTarget = dataCell{cfg.targetIndices(1)};
+    assert(ndims(firstTarget) == 3, ...
+        'HRRP目标数据必须是“距离×慢时间×样本”的三维数组。');
+    rangeCount = size(firstTarget, 1);
+    timeCount = size(firstTarget, 2);
+    classCount = numel(cfg.targetIndices);
+    totalTrain = cfg.trainCasesPerTarget * classCount;
+    totalTest  = cfg.testCasesPerTarget  * classCount;
+
+    trainData = zeros(rangeCount, timeCount, totalTrain, 'like', firstTarget);
+    testData  = zeros(rangeCount, timeCount, totalTest,  'like', firstTarget);
+    trainLabels = zeros(1, totalTrain);
+    testLabels  = zeros(1, totalTest);
+
+    for classPosition = 1:classCount
+        targetIndex = cfg.targetIndices(classPosition);
+        targetData = dataCell{targetIndex};
+        assert(ndims(targetData) == 3 && ...
+            size(targetData, 1) == rangeCount && ...
+            size(targetData, 2) == timeCount, ...
+            '目标%d的HRRP尺寸与其他目标不一致。', targetIndex);
+        requiredCases = cfg.trainCasesPerTarget + cfg.testCasesPerTarget;
+        assert(size(targetData, 3) >= requiredCases, ...
+            '目标%d只有%d个HRRP样本，训练和测试共需要%d个。', ...
+            targetIndex, size(targetData, 3), requiredCases);
+
+        trainPages = (classPosition - 1) * cfg.trainCasesPerTarget ...
+            + (1:cfg.trainCasesPerTarget);
+        testPages = (classPosition - 1) * cfg.testCasesPerTarget ...
+            + (1:cfg.testCasesPerTarget);
+        sourceTrain = 1:cfg.trainCasesPerTarget;
+        sourceTest = cfg.trainCasesPerTarget + ...
+            (1:cfg.testCasesPerTarget);
+
+        trainData(:, :, trainPages) = targetData(:, :, sourceTrain);
+        testData(:, :, testPages) = targetData(:, :, sourceTest);
+        trainLabels(trainPages) = cfg.classLabels(classPosition);
+        testLabels(testPages) = cfg.classLabels(classPosition);
+    end
+end
+
+function validateTargetCells(dataCell, cfg)
+    assert(numel(dataCell) >= max(cfg.targetIndices), ...
+        '输入Cell数量不足，无法读取最大目标序号%d。', ...
+        max(cfg.targetIndices));
+    for targetIndex = cfg.targetIndices
+        assert(~isempty(dataCell{targetIndex}), ...
+            '目标%d对应的Cell为空。', targetIndex);
+        assert(isnumeric(dataCell{targetIndex}), ...
+            '目标%d的数据必须是数值数组。', targetIndex);
+        assert(all(isfinite(dataCell{targetIndex}(:))), ...
+            '目标%d的数据包含NaN或Inf。', targetIndex);
+    end
+end
+
+function noisyData = addAwgnToRcsSamples(cleanData, snrDb, seed)
+% 每一行是一条RCS/窄带慢时间样本。
+    previousState = rng;
+    stateCleaner = onCleanup(@() rng(previousState));
+    rng(seed, 'twister');
+
+    noisyData = zeros(size(cleanData), 'like', cleanData);
+    for sampleIndex = 1:size(cleanData, 1)
+        cleanSample = cleanData(sampleIndex, :);
+        assert(mean(abs(cleanSample).^2) > 0, ...
+            'RCS第%d个样本的功率为0，无法按measured添加噪声。', sampleIndex);
+        noisyData(sampleIndex, :) = awgn(cleanSample, snrDb, 'measured');
+    end
+end
+
+function noisyData = addAwgnToHrrpSamples( ...
+        cleanData, snrDb, seed, hrrpNoise)
+% 每一个第三维切片是一幅HRRP样本；按照所选参考功率逐样本添加AWGN。
+    previousState = rng;
+    stateCleaner = onCleanup(@() rng(previousState));
+    rng(seed, 'twister');
+
+    noisyData = zeros(size(cleanData), 'like', cleanData);
+    for sampleIndex = 1:size(cleanData, 3)
+        cleanSample = cleanData(:, :, sampleIndex);
+        [referencePower, ~] = calculateHrrpReferencePower( ...
+            cleanSample, hrrpNoise);
+        assert(referencePower > 0, ...
+            'HRRP第%d个样本的功率为0，无法按measured添加噪声。', sampleIndex);
+
+        switch hrrpNoise.mode
+            case 'whole_sample'
+                % 保留原有调用，确保该模式与已有数据生成方式一致。
+                noisyVector = awgn(cleanSample(:), snrDb, 'measured');
+                noisySample = reshape(noisyVector, size(cleanSample));
+
+            case 'peak'
+                % 恢复IFFT前的频域回波，在频域按峰值SNR加噪，再变回HRRP。
+                cleanFrequencySample = hrrpToFrequencyEcho( ...
+                    cleanSample, hrrpNoise.inputIsFftShifted);
+                referencePowerDbw = 10 * log10(double(referencePower));
+                noisyFrequencyVector = awgn( ...
+                    cleanFrequencySample(:), snrDb, referencePowerDbw);
+                noisyFrequencySample = reshape( ...
+                    noisyFrequencyVector, size(cleanFrequencySample));
+                noisySample = frequencyEchoToHrrp( ...
+                    noisyFrequencySample, hrrpNoise.inputIsFftShifted);
+
+            case 'energy_fraction'
+                referencePowerDbw = 10 * log10(double(referencePower));
+                noisyVector = awgn(cleanSample(:), snrDb, referencePowerDbw);
+                noisySample = reshape(noisyVector, size(cleanSample));
+
+            otherwise
+                error('不支持的HRRP噪声模式：%s', hrrpNoise.mode);
+        end
+        noisyData(:, :, sampleIndex) = noisySample;
+    end
+end
+
+function report = evaluateTestNoise(cleanData, noisyData, labels, ...
+        sampleDimension, requestedSnrDb, dataType, noiseTest, ...
+        realizationIndex, hrrpNoise)
+% 根据“带噪数据-干净数据”计算测试样本的实际SNR。
+    if nargin < 9
+        hrrpNoise = [];
+    end
+    assert(isequal(size(cleanData), size(noisyData)), ...
+        '噪声核验要求干净数据和带噪数据尺寸完全一致。');
+    totalSampleCount = size(cleanData, sampleDimension);
+    assert(numel(labels) == totalSampleCount, ...
+        '噪声核验时样本数与标签数不一致。');
+
+    mode = lower(char(noiseTest.mode));
+    switch mode
+        case 'random'
+            selectedCount = min(noiseTest.randomSampleCount, totalSampleCount);
+            previousState = rng;
+            stateCleaner = onCleanup(@() rng(previousState));
+            rng(noiseTest.randomSeedBase + realizationIndex - 1, 'twister');
+            sampleIndices = sort(randperm(totalSampleCount, selectedCount));
+
+        case 'all'
+            sampleIndices = 1:totalSampleCount;
+
+        otherwise
+            error('不支持的噪声核验模式：%s', mode);
+    end
+
+    measuredSnrDb = zeros(1, numel(sampleIndices));
+    referenceRangeBinCounts = nan(1, numel(sampleIndices));
+    for position = 1:numel(sampleIndices)
+        sampleIndex = sampleIndices(position);
+        cleanSample = extractSample(cleanData, sampleDimension, sampleIndex);
+        noisySample = extractSample(noisyData, sampleDimension, sampleIndex);
+        noiseSample = noisySample - cleanSample;
+        if strcmpi(dataType, 'HRRP')
+            [signalPower, referenceBins] = calculateHrrpReferencePower( ...
+                cleanSample, hrrpNoise);
+            if ~isempty(referenceBins)
+                referenceRangeBinCounts(position) = numel(referenceBins);
+            end
+        else
+            signalPower = mean(abs(cleanSample(:)).^2);
+        end
+        if strcmpi(dataType, 'HRRP') && strcmp(hrrpNoise.mode, 'peak')
+            cleanFrequencySample = hrrpToFrequencyEcho( ...
+                cleanSample, hrrpNoise.inputIsFftShifted);
+            noisyFrequencySample = hrrpToFrequencyEcho( ...
+                noisySample, hrrpNoise.inputIsFftShifted);
+            frequencyNoise = noisyFrequencySample - cleanFrequencySample;
+            noisePower = mean(abs(frequencyNoise(:)).^2);
+        else
+            % AWGN在所有距离单元上同方差；整幅估计可减小有限样本波动。
+            noisePower = mean(abs(noiseSample(:)).^2);
+        end
+        assert(signalPower > 0 && noisePower > 0, ...
+            '%s测试样本%d的信号或噪声功率为0。', dataType, sampleIndex);
+        measuredSnrDb(position) = 10 * log10(signalPower / noisePower);
+    end
+
+    errorsDb = measuredSnrDb - requestedSnrDb;
+    selectedLabels = double(labels(sampleIndices));
+    uniqueLabels = unique(selectedLabels, 'stable');
+    classMeanSnrDb = zeros(size(uniqueLabels));
+    classStdSnrDb = zeros(size(uniqueLabels));
+    classSampleCounts = zeros(size(uniqueLabels));
+    for classPosition = 1:numel(uniqueLabels)
+        classMask = selectedLabels == uniqueLabels(classPosition);
+        classMeanSnrDb(classPosition) = mean(measuredSnrDb(classMask));
+        classStdSnrDb(classPosition) = std(measuredSnrDb(classMask));
+        classSampleCounts(classPosition) = sum(classMask);
+    end
+
+    report = struct();
+    report.data_type = dataType;
+    report.mode = mode;
+    if strcmpi(dataType, 'HRRP')
+        report.snr_reference_mode = hrrpNoise.mode;
+        if strcmp(hrrpNoise.mode, 'peak')
+            report.snr_domain = 'frequency_before_ifft';
+        else
+            report.snr_domain = 'hrrp_after_ifft';
+        end
+        report.energy_fraction = hrrpNoise.energyFraction;
+        report.reference_range_bin_counts = referenceRangeBinCounts;
+    else
+        report.snr_reference_mode = 'whole_sample';
+        report.snr_domain = 'sample';
+        report.energy_fraction = [];
+        report.reference_range_bin_counts = [];
+    end
+    report.requested_snr_db = requestedSnrDb;
+    report.sample_count = numel(sampleIndices);
+    report.sample_indices = sampleIndices;
+    report.sample_labels = selectedLabels;
+    report.measured_snr_db = measuredSnrDb;
+    report.mean_snr_db = mean(measuredSnrDb);
+    report.std_snr_db = std(measuredSnrDb);
+    report.minimum_snr_db = min(measuredSnrDb);
+    report.maximum_snr_db = max(measuredSnrDb);
+    report.mean_error_db = mean(errorsDb);
+    report.mean_absolute_error_db = mean(abs(errorsDb));
+    report.maximum_absolute_error_db = max(abs(errorsDb));
+    report.class_labels = uniqueLabels;
+    report.class_sample_counts = classSampleCounts;
+    report.class_mean_snr_db = classMeanSnrDb;
+    report.class_std_snr_db = classStdSnrDb;
+
+    fprintf(['噪声核验 %s：目标SNR=%g dB，抽样模式=%s，SNR参考=%s，样本数=%d，' ...
+        '实测均值=%.3f dB，标准差=%.3f dB，范围=[%.3f, %.3f] dB，' ...
+        '平均绝对误差=%.3f dB。\n'], ...
+        dataType, requestedSnrDb, mode, report.snr_reference_mode, ...
+        report.sample_count, ...
+        report.mean_snr_db, report.std_snr_db, ...
+        report.minimum_snr_db, report.maximum_snr_db, ...
+        report.mean_absolute_error_db);
+
+    if noiseTest.printEachSample
+        for position = 1:numel(sampleIndices)
+            fprintf('  样本%d，标签%d：实测SNR=%.3f dB。\n', ...
+                sampleIndices(position), selectedLabels(position), ...
+                measuredSnrDb(position));
+        end
+    end
+
+    threshold = noiseTest.warnMeanAbsoluteErrorDb;
+    if ~isempty(threshold) && report.mean_absolute_error_db > threshold
+        warning(['%s测试集的平均绝对SNR误差%.3f dB超过配置阈值%.3f dB。' ...
+            '有限长度随机噪声会产生正常波动。'], ...
+            dataType, report.mean_absolute_error_db, threshold);
+    end
+end
+
+function [referencePower, referenceBins] = ...
+        calculateHrrpReferencePower(cleanSample, hrrpNoise)
+% 根据配置返回HRRP的SNR参考功率及参与参考功率计算的距离单元。
+    assert(~isempty(hrrpNoise) && isstruct(hrrpNoise), ...
+        '计算HRRP参考功率时必须提供hrrpNoise配置。');
+    rangeCount = size(cleanSample, 1);
+
+    switch hrrpNoise.mode
+        case 'whole_sample'
+            referencePower = mean(abs(cleanSample(:)).^2);
+            referenceBins = 1:rangeCount;
+
+        case 'peak'
+            cleanFrequencySample = hrrpToFrequencyEcho( ...
+                cleanSample, hrrpNoise.inputIsFftShifted);
+            referencePower = max(abs(cleanFrequencySample(:)).^2);
+            % 该模式的参考位于频域，不对应某个HRRP距离单元。
+            referenceBins = [];
+
+        case 'energy_fraction'
+            rangePower = mean(abs(cleanSample).^2, 2);
+            totalPower = sum(rangePower);
+            assert(totalPower > 0, 'HRRP样本总功率为0，无法选择主距离单元。');
+            [sortedPower, sortedIndices] = sort(rangePower, 'descend');
+            cumulativeFraction = cumsum(sortedPower) ./ totalPower;
+            selectedCount = find(cumulativeFraction >= ...
+                hrrpNoise.energyFraction, 1, 'first');
+            referenceBins = sort(sortedIndices(1:selectedCount));
+            referencePower = mean(rangePower(referenceBins));
+
+        otherwise
+            error('不支持的HRRP噪声模式：%s', hrrpNoise.mode);
+    end
+end
+
+function frequencyEcho = hrrpToFrequencyEcho(hrrpSample, inputIsFftShifted)
+% 撤销generate_dynamic_rcs_hrrp_reusable中的fftshift和ifft。
+    if inputIsFftShifted
+        rangeProfile = ifftshift(hrrpSample, 1);
+    else
+        rangeProfile = hrrpSample;
+    end
+    frequencyEcho = fft(rangeProfile, [], 1);
+end
+
+function hrrpSample = frequencyEchoToHrrp( ...
+        frequencyEcho, outputShouldBeFftShifted)
+% 将频域回波沿频率维IFFT回HRRP，并恢复原来的距离维排列。
+    hrrpSample = ifft(frequencyEcho, [], 1);
+    if outputShouldBeFftShifted
+        hrrpSample = fftshift(hrrpSample, 1);
+    end
+end
+
+function mode = normalizeHrrpNoiseMode(configuredMode)
+% 接受少量直观别名，但在保存的dataset_cfg中统一使用规范名称。
+    mode = lower(strtrim(char(configuredMode)));
+    switch mode
+        case {'whole_sample', 'measured', 'original'}
+            mode = 'whole_sample';
+        case {'peak', 'peak_snr'}
+            mode = 'peak';
+        case {'energy_fraction', 'energy95', '95_energy'}
+            mode = 'energy_fraction';
+        otherwise
+            error(['hrrpNoise.mode不支持''%s''；可用值为whole_sample、' ...
+                'peak或energy_fraction。'], configuredMode);
+    end
+end
+
+function sample = extractSample(data, sampleDimension, sampleIndex)
+    subscripts = repmat({':'}, 1, ndims(data));
+    subscripts{sampleDimension} = sampleIndex;
+    sample = data(subscripts{:});
+end
+
+function saveDataset(fileName, trainData, trainLabels, ...
+        testData, testLabels, snrDb, noiseReport, cfg, matVersion)
+    train_data = trainData;
+    train_labels = trainLabels;
+    test_data = testData;
+    test_labels = testLabels;
+    snr_db = snrDb;
+    noise_report = noiseReport;
+    dataset_cfg = cfg;
+    save(fileName, 'train_data', 'train_labels', ...
+        'test_data', 'test_labels', 'snr_db', 'noise_report', ...
+        'dataset_cfg', matVersion);
+end
+
+function tag = formatSnrTag(snrDb)
+    absoluteText = sprintf('%g', abs(snrDb));
+    absoluteText = strrep(absoluteText, '.', 'p');
+    if snrDb < 0
+        tag = ['m', absoluteText, 'dB'];
+    else
+        tag = [absoluteText, 'dB'];
+    end
+end
+
+function tag = formatRealizationTag(index, count)
+    if count == 1
+        tag = '';
+    else
+        tag = sprintf('_r%02d', index);
+    end
+end
+
+function showProgress(cfg, dataType, snrDb, realizationIndex, ...
+        realizationCount, trainSize, testSize)
+    if cfg.showProgress
+        fprintf(['%s：SNR=%g dB，噪声实现%d/%d，' ...
+            '训练尺寸%s，测试尺寸%s。\n'], ...
+            dataType, snrDb, realizationIndex, realizationCount, ...
+            mat2str(trainSize), mat2str(testSize));
+    end
+end
+
+function merged = mergeStructRecursive(base, override)
+    merged = base;
+    names = fieldnames(override);
+    for index = 1:numel(names)
+        name = names{index};
+        if isfield(merged, name) && isstruct(merged.(name)) && ...
+                isstruct(override.(name))
+            merged.(name) = mergeStructRecursive( ...
+                merged.(name), override.(name));
+        else
+            merged.(name) = override.(name);
+        end
+    end
+end
