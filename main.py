@@ -10,12 +10,10 @@ import scipy.io
 import torch.nn.functional as F
 from sklearn.metrics import confusion_matrix
 from tqdm import tqdm
-from thop import profile
-from thop import clever_format
 from args_file import get_args
 
 from utils.data_utils import Dataset, Dataset_Text
-from utils.func_utils import compute_flops_params
+from utils.count_utils import compute_flops_params
 from model.models import GATFusion3_Net
 
 args = get_args().parse_args()
@@ -102,14 +100,14 @@ if __name__ == '__main__':
     loss_fn = nn.CrossEntropyLoss()
     loss_fn.to(device)
 
-    # # 计算网络的FLOPs和参数量（跑完需要注释掉！）
+    # 计算网络的FLOPs和参数量（内部对model做deepcopy，不影响后续训练）
     # input_rcsdata = torch.randn(64, 1, 101).to(device)
     # input_hrrpdata = torch.randn(64, 101, 101).to(device)
     # input_textdata = torch.randn(64, 128).to(device)
     # input_list = [input_rcsdata, input_rcsdata, input_hrrpdata, input_textdata,
     #               input_rcsdata, input_rcsdata, input_hrrpdata, input_textdata,
     #               input_rcsdata, input_rcsdata, input_hrrpdata, input_textdata]
-    # flops, params = compute_flops_params(model, input_list) # 计算量FLOPS为:5.713G, 参数量Params为:29.360M
+    # flops, params = compute_flops_params(model, input_list)
 
     # 注意，1.如果用SGD优化器，一般学习率大一点，如0.1、0.05；Adam优化器学习率可以小一点,如0.001、0.0001
     #      2.最好加上weight_decay(L2正则化)和学习率衰减
